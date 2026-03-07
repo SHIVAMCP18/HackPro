@@ -148,6 +148,58 @@ def get_user_activity(user_id: str, limit: int = 200) -> list:
     return logs
 
 
+def record_failed_login(username: str):
+    """Log a failed login attempt to audit_logs."""
+    sb = get_client()
+    sb.table("audit_logs").insert({
+        "user_id": None,
+        "action": "failed_login",
+        "file_id": None,
+        "details": {"username": username},
+        "ip_address": None
+    }).execute()
+
+
+def get_failed_logins():
+    """Get failed login counts grouped by username for admin view."""
+    sb = get_client()
+    res = sb.table("audit_logs").select("details, timestamp").eq("action", "failed_login").order("timestamp", desc=True).execute()
+    counts = {}
+    recent = {}
+    for row in (res.data or []):
+        uname = (row.get("details") or {}).get("username", "unknown")
+        counts[uname] = counts.get(uname, 0) + 1
+        if uname not in recent:
+            recent[uname] = str(row.get("timestamp", ""))[:19].replace("T", " ")
+    return [{"username": u, "attempts": c, "last_attempt": recent[u]} for u, c in sorted(counts.items(), key=lambda x: x[1], reverse=True)]
+
+
+def change_password(user_id: str, new_password: str):
+    sb = get_client()
+    hashed = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+    sb.table("users").update({"password_hash": hashed}).eq("id", user_id).execute()
+
+
+def delete_file_record(file_id: str):
+    """Delete file and related records from DB (admin only)."""
+    sb = get_client()
+    sb.table("pii_detections").delete().eq("file_id", file_id).execute()
+    sb.table("audit_logs").delete().eq("file_id", file_id).execute()
+    sb.table("files").delete().eq("id", file_id).execute()
+
+
+def get_pii_summary_all():
+    """Aggregate PII type counts across all files from pii_summary JSONB."""
+    sb = get_client()
+    res = sb.table("files").select("pii_summary").eq("status", "done").execute()
+    totals = {}
+    for row in (res.data or []):
+        summary = row.get("pii_summary") or {}
+        for pii_type, count in summary.items():
+            totals[pii_type] = totals.get(pii_type, 0) + (count or 0)
+    return totals
+
+
 def get_audit_logs(limit=100):
     sb = get_client()
     res = sb.table("audit_logs").select(
