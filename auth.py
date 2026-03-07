@@ -102,7 +102,7 @@ def show_login_page():
     with st.form("login_form"):
         username = st.text_input("Username", placeholder="Enter username")
         password = st.text_input("Password", type="password", placeholder="Enter password")
-        submitted = st.form_submit_button("Sign In", width='stretch')
+        submitted = st.form_submit_button("Sign In", use_container_width=True)
         if submitted:
             if login(username, password):
                 st.rerun()
