@@ -10,15 +10,6 @@ from supabase import create_client
 
 load_dotenv()
 
-# Bridge Streamlit Cloud secrets → environment variables
-try:
-    import streamlit as st
-    if hasattr(st, "secrets"):
-        for _k, _v in st.secrets.items():
-            os.environ.setdefault(_k, str(_v))
-except Exception:
-    pass
-
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
