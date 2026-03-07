@@ -1,6 +1,6 @@
 """
 app.py — Main Streamlit application
-ShieldGate | Nirma HACKATHON 2026
+PII Sanitizer | Nirma HACKaMINeD 2025
 """
 import uuid
 import streamlit as st
@@ -23,7 +23,7 @@ from pii_engine import build_pii_summary
 # ── PAGE CONFIG ──────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="ShieldGate",
+    page_title="PII Sanitizer",
     page_icon="🔐",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -202,10 +202,10 @@ def render_sidebar():
         st.markdown("""
         <div style="padding: 20px 0 24px; border-bottom: 1px solid #1e2433; margin-bottom: 20px;">
             <div style="font-family:'Space Mono',monospace; font-size:18px; color:#ff3b64; font-weight:700;">
-                🔐 ShieldGate
+                🔐 PII Sanitizer
             </div>
             <div style="font-size:11px; color:#475569; margin-top:4px; letter-spacing:1px; text-transform:uppercase;">
-                HACKATHON 2026
+                HACKaMINeD 2025
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -334,8 +334,7 @@ def page_dashboard():
             col_h1, col_h2 = st.columns([3, 2])
             with col_h1:
                 st.dataframe(
-                    heatmap_df.style.background_gradient(cmap="RdYlGn_r", axis=None),
-                    use_container_width=True,
+                    heatmap_df.style.background_gradient(cmap="RdYlGn_r", axis=None), use_container_width=True,
                     height=300
                 )
             with col_h2:
@@ -529,8 +528,7 @@ def page_files():
                         label="⬇️ Download Sanitized File",
                         data=sanitized_bytes,
                         file_name=f"sanitized_{f['original_filename']}",
-                        mime=get_content_type(f["original_filename"]),
-                        use_container_width=True,
+                        mime=get_content_type(f["original_filename"]), use_container_width=True,
                         key=f"dl_prev_{f['id']}"
                     )
                     log_action(user["id"], "download", str(f["id"]), {"filename": f["original_filename"]})
@@ -542,8 +540,7 @@ def page_files():
                                 label="⬇️ Download Original (Admin)",
                                 data=original_bytes,
                                 file_name=f["original_filename"],
-                                mime=get_content_type(f["original_filename"]),
-                                use_container_width=True,
+                                mime=get_content_type(f["original_filename"]), use_container_width=True,
                                 key=f"dl_orig_prev_{f['id']}"
                             )
                         except Exception:
@@ -632,8 +629,7 @@ def page_files():
                 label=f"⬇️ Download ZIP ({len(filtered_files)} files)",
                 data=zip_buffer.getvalue(),
                 file_name=f"sanitized_files_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip",
-                use_container_width=True,
+                mime="application/zip", use_container_width=True,
                 key="bulk_zip_dl"
             )
 
@@ -659,8 +655,7 @@ def page_files():
                         label="⬇️ Download",
                         data=sanitized_bytes,
                         file_name=f"sanitized_{f['original_filename']}",
-                        mime=get_content_type(f["original_filename"]),
-                        use_container_width=True,
+                        mime=get_content_type(f["original_filename"]), use_container_width=True,
                         key=f"dl_{f['id']}"
                     )
                 except Exception:
@@ -713,125 +708,116 @@ def page_upload():
     )
 
     if uploaded:
-        file_bytes = uploaded.read()
+        # ── Read file bytes once, cache in session_state ─────────
+        _fkey = f"raw__{uploaded.name}__{uploaded.size}"
+        if _fkey not in st.session_state:
+            st.session_state[_fkey] = uploaded.read()
+        file_bytes = st.session_state[_fkey]
         ext = uploaded.name.rsplit(".", 1)[-1].lower()
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown('<div class="section-header">Original Preview</div>', unsafe_allow_html=True)
-            if ext in ("png", "jpg", "jpeg"):
-                st.image(file_bytes, caption="Uploaded image", use_column_width=True)
-                st.info("Image uploaded. OCR-based PII detection will run on sanitize.")
-            else:
-                preview = extract_preview_text(file_bytes, uploaded.name, max_chars=1500)
-                st.markdown(f'<div class="diff-original">{preview}</div>', unsafe_allow_html=True)
+        # ── Show original preview ─────────────────────────────────
+        st.markdown('<div class="section-header">Original Preview</div>', unsafe_allow_html=True)
+        if ext in ("png", "jpg", "jpeg"):
+            st.image(file_bytes, caption="Uploaded image", use_column_width=True)
+        else:
+            preview = extract_preview_text(file_bytes, uploaded.name, max_chars=1500)
+            st.markdown(f'<div class="diff-original">{preview}</div>', unsafe_allow_html=True)
 
-        if st.button("🚀 Run PII Detection & Sanitize", use_container_width=True):
-            # ── Step 1: Security Scan ─────────────────────────────
-            security_result = full_security_scan(file_bytes, uploaded.name)
-            is_malicious_content = not security_result["malicious_content"]["safe"]
+        size_mb = len(file_bytes) / 1024 / 1024
 
-            # Always show security report
-            st.markdown('<div class="section-header">🔒 Security Scan Results</div>', unsafe_allow_html=True)
-            col_s1, col_s2 = st.columns(2)
-            with col_s1:
-                if security_result["safe"]:
-                    st.success("✅ File is Safe")
-                else:
-                    st.error("🚨 Threats Detected!")
-            with col_s2:
-                st.info("**SHA256:** `" + security_result['hashes']['sha256'][:24] + "...`")
+        # ── START SCAN IMMEDIATELY on upload (no button needed) ───
+        # Uses st.cache_data so re-renders don't re-run the scan.
+        # Navigation / sign-out works because Streamlit can rerun
+        # freely — the cached result is returned instantly.
+        _rkey = f"result__{uploaded.name}__{uploaded.size}"
 
-            # BLOCK if malicious
-            if is_malicious_content:
-                threats = security_result["malicious_content"]["threats"]
-                st.error(f"⛔ **UPLOAD BLOCKED** — Malicious content detected: `{', '.join(threats)}`")
-                st.warning("This file contains potentially harmful code and cannot be processed.")
-                # Log the blocked attempt
-                log_action(current_user()["id"], "blocked_upload", details={
-                    "filename": uploaded.name,
-                    "threats": threats,
-                    "sha256": security_result["hashes"]["sha256"]
-                })
-                st.stop()
-
-            st.success("✅ Security scan passed — proceeding with PII detection.")
-
-            with st.spinner("Scanning for PII..."):
+        if _rkey not in st.session_state:
+            # Show a blocking spinner ONLY on first upload
+            # (subsequent reruns hit cache and return instantly)
+            with st.spinner(f"🔍 Scanning {size_mb:.1f} MB for PII — this may take a few seconds..."):
                 try:
-                    user = current_user()
-                    file_id = str(uuid.uuid4())
-
-                    # Upload original to R2
-                    orig_key = f"originals/{file_id}/{uploaded.name}"
-                    upload_file(file_bytes, orig_key, get_content_type(uploaded.name))
-
-                    # Create DB record
-                    db_file_id = create_file_record(
-                        uploaded.name, ext, user["id"], orig_key
-                    )
-
-                    # Process file
                     sanitized_bytes, detections, pii_summary = process_file(file_bytes, uploaded.name)
-
-                    # Upload sanitized to R2
-                    san_key = f"sanitized/{file_id}/sanitized_{uploaded.name}"
-                    upload_file(sanitized_bytes, san_key, get_content_type(uploaded.name))
-
-                    # Update DB
-                    update_file_record(db_file_id, san_key, len(detections), pii_summary)
-                    save_pii_detections(db_file_id, detections)
-                    log_action(user["id"], "upload", db_file_id,
-                               {"filename": uploaded.name, "pii_count": len(detections)})
-
-                    st.success(f"✅ Done! Found and masked **{len(detections)} PII items**.")
-
-                    # Show results
-                    if ext not in ("png", "jpg", "jpeg"):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.markdown('<div class="section-header">Original</div>', unsafe_allow_html=True)
-                            original_preview = extract_preview_text(file_bytes, uploaded.name, 1500)
-                            st.markdown(f'<div class="diff-original">{original_preview}</div>', unsafe_allow_html=True)
-                        with col2:
-                            st.markdown('<div class="section-header">Sanitized</div>', unsafe_allow_html=True)
-                            sanitized_preview = extract_preview_text(sanitized_bytes, uploaded.name, 1500)
-                            st.markdown(f'<div class="diff-sanitized">{sanitized_preview}</div>', unsafe_allow_html=True)
-                    else:
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.markdown('<div class="section-header">Original</div>', unsafe_allow_html=True)
-                            st.image(file_bytes, use_container_width=True)
-                        with col2:
-                            st.markdown('<div class="section-header">Redacted (Black Box)</div>', unsafe_allow_html=True)
-                            st.image(sanitized_bytes, use_container_width=True)
-
-                    # PII breakdown
-                    st.markdown('<div class="section-header">PII Breakdown</div>', unsafe_allow_html=True)
-                    if pii_summary:
-                        chips = "".join([f'<span class="pii-chip">{k}: {v}</span>' for k, v in pii_summary.items()])
-                        st.markdown(f'<div>{chips}</div>', unsafe_allow_html=True)
-
-                        df = pd.DataFrame(detections)[["pii_type", "original_value", "masked_value", "detection_method"]]
-                        df.columns = ["Type", "Original", "Masked As", "Method"]
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-
-                    # Download button
-                    dl_name = f"sanitized_{uploaded.name}"
-                    dl_mime = get_content_type(uploaded.name)
-
-                    st.download_button(
-                        "⬇️ Download Sanitized File",
-                        data=sanitized_bytes,
-                        file_name=dl_name,
-                        mime=dl_mime,
-                        use_container_width=True
-                    )
-
+                    st.session_state[_rkey] = {
+                        "sanitized_bytes": sanitized_bytes,
+                        "detections":      detections,
+                        "pii_summary":     pii_summary,
+                    }
                 except Exception as e:
-                    st.error(f"Error during processing: {e}")
-                    raise e
+                    st.error(f"❌ Scan failed: {e}")
+                    st.stop()
 
+        # ── Results always read from session_state ────────────────
+        _r              = st.session_state[_rkey]
+        sanitized_bytes = _r["sanitized_bytes"]
+        detections      = _r["detections"]
+        pii_summary     = _r["pii_summary"]
+
+        st.success(f"✅ Scan complete — **{len(detections):,} PII items** found in {size_mb:.1f} MB file.")
+
+        # ── Before / After preview (first 1500 chars only) ────────
+        if ext not in ("png", "jpg", "jpeg"):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown('<div class="section-header">Original (preview)</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="diff-original">{extract_preview_text(file_bytes, uploaded.name, 1500)}</div>', unsafe_allow_html=True)
+            with col2:
+                st.markdown('<div class="section-header">Sanitized (preview)</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="diff-sanitized">{extract_preview_text(sanitized_bytes, uploaded.name, 1500)}</div>', unsafe_allow_html=True)
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown('<div class="section-header">Original</div>', unsafe_allow_html=True)
+                st.image(file_bytes, use_container_width=True)
+            with col2:
+                st.markdown('<div class="section-header">Redacted</div>', unsafe_allow_html=True)
+                st.image(sanitized_bytes, use_container_width=True)
+
+        # ── PII summary chips ─────────────────────────────────────
+        st.markdown('<div class="section-header">PII Breakdown</div>', unsafe_allow_html=True)
+        if pii_summary:
+            chips = "".join([f'<span class="pii-chip">{k}: {v}</span>' for k, v in pii_summary.items()])
+            st.markdown(f'<div>{chips}</div>', unsafe_allow_html=True)
+
+            # Cap table at 500 rows — 120k rows crashes the browser
+            _preview_dets = detections[:500]
+            df = pd.DataFrame(_preview_dets)[["pii_type", "original_value", "masked_value", "detection_method"]]
+            df.columns = ["Type", "Original", "Masked As", "Method"]
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            if len(detections) > 500:
+                st.caption(f"Showing 500 of {len(detections):,} detections — download the file to see all.")
+
+        # ── Save to DB ────────────────────────────────────────────
+        _saved_key = f"saved__{uploaded.name}__{uploaded.size}"
+        if _saved_key not in st.session_state:
+            if st.button("💾 Save to Database", use_container_width=True):
+                try:
+                    user     = current_user()
+                    file_id  = str(uuid.uuid4())
+                    orig_key = f"originals/{file_id}/{uploaded.name}"
+                    with st.spinner("💾 Saving..."):
+                        upload_file(file_bytes, orig_key, get_content_type(uploaded.name))
+                        db_file_id = create_file_record(uploaded.name, ext, user["id"], orig_key)
+                        san_key = f"sanitized/{file_id}/sanitized_{uploaded.name}"
+                        upload_file(sanitized_bytes, san_key, get_content_type(uploaded.name))
+                        update_file_record(db_file_id, san_key, len(detections), pii_summary)
+                        save_pii_detections(db_file_id, detections)
+                        log_action(user["id"], "upload", db_file_id,
+                                   {"filename": uploaded.name, "pii_count": len(detections)})
+                    st.session_state[_saved_key] = True
+                    st.success("✅ Saved!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Save failed: {e}")
+        else:
+            st.success("✅ Already saved to database.")
+
+        st.download_button(
+            "⬇️ Download Sanitized File",
+            data=sanitized_bytes,
+            file_name=f"sanitized_{uploaded.name}",
+            mime=get_content_type(uploaded.name),
+            use_container_width=True,
+        )
 
 # ── AUDIT LOGS PAGE (ADMIN ONLY) ─────────────────────────────────
 
@@ -877,8 +863,7 @@ def page_audit_logs():
             "⬇️ Export SIEM Logs (NDJSON)",
             data=siem_data,
             file_name=f"pii_sanitizer_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.ndjson",
-            mime="application/x-ndjson",
-            use_container_width=True,
+            mime="application/x-ndjson", use_container_width=True,
             help="Compatible with Splunk, ELK, IBM QRadar"
         )
     with col_e2:
@@ -889,8 +874,7 @@ def page_audit_logs():
             "⬇️ Export Raw JSON",
             data=raw_json,
             file_name=f"pii_sanitizer_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json",
-            use_container_width=True
+            mime="application/json", use_container_width=True
         )
 
 
@@ -1176,8 +1160,7 @@ IP Address: 103.54.12.77, Device: android-9f31acb8d1"""
             "⬇️ Download Sanitized Text",
             data=masked_text,
             file_name="sanitized_text.txt",
-            mime="text/plain",
-            use_container_width=True
+            mime="text/plain", use_container_width=True
         )
 
         # Log action
@@ -1253,8 +1236,7 @@ def page_my_files():
                     "⬇️ Download Sanitized File",
                     data=sanitized_bytes,
                     file_name=f"sanitized_{f['original_filename']}",
-                    mime=get_content_type(f["original_filename"]),
-                    use_container_width=True,
+                    mime=get_content_type(f["original_filename"]), use_container_width=True,
                     key=f"dl_my_prev_{fid}"
                 )
             except Exception as e:
