@@ -230,7 +230,7 @@ def render_sidebar():
 
             st.markdown("<div style='margin-top:auto; padding-top:40px;'>", unsafe_allow_html=True)
             st.markdown(f'<div style="font-size:11px;color:#475569;margin-bottom:8px;">⏱️ Auto-logout after 30 min inactivity</div>', unsafe_allow_html=True)
-            if st.button("Sign Out", width='stretch'):
+            if st.button("Sign Out", use_container_width=True):
                 logout()
 
             return page.split(" ", 1)[1].strip()  # strip emoji
@@ -281,7 +281,7 @@ def page_dashboard():
             with col_chart1:
                 st.bar_chart(chart_df.set_index("PII Type"), color="#ff3b64", height=280)
             with col_chart2:
-                st.dataframe(chart_df, width='stretch', hide_index=True, height=280)
+                st.dataframe(chart_df, use_container_width=True, hide_index=True, height=280)
         else:
             st.info("No PII breakdown data available yet.")
 
@@ -335,7 +335,7 @@ def page_dashboard():
             with col_h1:
                 st.dataframe(
                     heatmap_df.style.background_gradient(cmap="RdYlGn_r", axis=None),
-                    width='stretch',
+                    use_container_width=True,
                     height=300
                 )
             with col_h2:
@@ -433,7 +433,7 @@ def _render_file_preview(file_bytes: bytes, filename: str, file_id: str):
         st.markdown(pdf_html, unsafe_allow_html=True)
 
     elif ext in ("png", "jpg", "jpeg"):
-        st.image(file_bytes, width='stretch')
+        st.image(file_bytes, use_container_width=True)
 
     elif ext == "docx":
         from docx import Document
@@ -445,7 +445,7 @@ def _render_file_preview(file_bytes: bytes, filename: str, file_id: str):
     elif ext == "csv":
         import io
         df_prev = pd.read_csv(io.BytesIO(file_bytes))
-        st.dataframe(df_prev, width='stretch')
+        st.dataframe(df_prev, use_container_width=True)
 
     elif ext == "json":
         import json as _json
@@ -530,7 +530,7 @@ def page_files():
                         data=sanitized_bytes,
                         file_name=f"sanitized_{f['original_filename']}",
                         mime=get_content_type(f["original_filename"]),
-                        width='stretch',
+                        use_container_width=True,
                         key=f"dl_prev_{f['id']}"
                     )
                     log_action(user["id"], "download", str(f["id"]), {"filename": f["original_filename"]})
@@ -543,7 +543,7 @@ def page_files():
                                 data=original_bytes,
                                 file_name=f["original_filename"],
                                 mime=get_content_type(f["original_filename"]),
-                                width='stretch',
+                                use_container_width=True,
                                 key=f"dl_orig_prev_{f['id']}"
                             )
                         except Exception:
@@ -559,7 +559,7 @@ def page_files():
                 st.markdown('<div class="section-header">PII Detections</div>', unsafe_allow_html=True)
                 df = pd.DataFrame(detections)[["pii_type", "masked_value", "detection_method"]]
                 df.columns = ["Type", "Masked As", "Method"]
-                st.dataframe(df, width='stretch', hide_index=True)
+                st.dataframe(df, use_container_width=True, hide_index=True)
         return
 
     # ── File list view ────────────────────────────────────────────
@@ -615,7 +615,7 @@ def page_files():
 
     # ── BULK DOWNLOAD ─────────────────────────────────────────────
     if filtered_files:
-        if st.button("📦 Bulk Download All Filtered Files as ZIP", width='stretch'):
+        if st.button("📦 Bulk Download All Filtered Files as ZIP", use_container_width=True):
             import zipfile, io as _io
             zip_buffer = _io.BytesIO()
             with st.spinner(f"Packaging {len(filtered_files)} files..."):
@@ -633,7 +633,7 @@ def page_files():
                 data=zip_buffer.getvalue(),
                 file_name=f"sanitized_files_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
                 mime="application/zip",
-                width='stretch',
+                use_container_width=True,
                 key="bulk_zip_dl"
             )
 
@@ -647,7 +647,7 @@ def page_files():
             uploader = f" · by **{f['uploader']}**" if is_admin() and f.get("uploader") else ""
             st.caption(f"{f['file_type'].upper()} · {str(f['upload_time'])[:16]}{uploader} · 🔴 {pii_count} PII masked")
         with col2:
-            if st.button("👁️ Preview", key=f"prev_{f['id']}", width='stretch'):
+            if st.button("👁️ Preview", key=f"prev_{f['id']}", use_container_width=True):
                 st.session_state["preview_file_id"] = str(f["id"])
                 log_action(user["id"], "view", str(f["id"]), {"filename": f["original_filename"]})
                 st.rerun()
@@ -660,14 +660,14 @@ def page_files():
                         data=sanitized_bytes,
                         file_name=f"sanitized_{f['original_filename']}",
                         mime=get_content_type(f["original_filename"]),
-                        width='stretch',
+                        use_container_width=True,
                         key=f"dl_{f['id']}"
                     )
                 except Exception:
                     st.caption("Unavailable")
         if is_admin():
             with col4:
-                if st.button("🗑️", key=f"del_{f['id']}", help="Delete this file (admin only)", width='stretch'):
+                if st.button("🗑️", key=f"del_{f['id']}", help="Delete this file (admin only)", use_container_width=True):
                     st.session_state[f"confirm_del_{f['id']}"] = True
                     st.rerun()
 
@@ -676,7 +676,7 @@ def page_files():
                 st.warning(f"⚠️ Delete **{f['original_filename']}**? This cannot be undone.")
                 c_yes, c_no = st.columns(2)
                 with c_yes:
-                    if st.button("✅ Yes, Delete", key=f"yes_{f['id']}", width='stretch'):
+                    if st.button("✅ Yes, Delete", key=f"yes_{f['id']}", use_container_width=True):
                         try:
                             from storage import delete_file as storage_delete
                             if f.get("sanitized_r2_key"):
@@ -693,7 +693,7 @@ def page_files():
                         except Exception as e:
                             st.error(f"Delete failed: {e}")
                 with c_no:
-                    if st.button("❌ Cancel", key=f"no_{f['id']}", width='stretch'):
+                    if st.button("❌ Cancel", key=f"no_{f['id']}", use_container_width=True):
                         st.session_state.pop(f"confirm_del_{f['id']}", None)
                         st.rerun()
         st.divider()
@@ -726,7 +726,7 @@ def page_upload():
                 preview = extract_preview_text(file_bytes, uploaded.name, max_chars=1500)
                 st.markdown(f'<div class="diff-original">{preview}</div>', unsafe_allow_html=True)
 
-        if st.button("🚀 Run PII Detection & Sanitize", width='stretch'):
+        if st.button("🚀 Run PII Detection & Sanitize", use_container_width=True):
             # ── Step 1: Security Scan ─────────────────────────────
             security_result = full_security_scan(file_bytes, uploaded.name)
             is_malicious_content = not security_result["malicious_content"]["safe"]
@@ -801,10 +801,10 @@ def page_upload():
                         col1, col2 = st.columns(2)
                         with col1:
                             st.markdown('<div class="section-header">Original</div>', unsafe_allow_html=True)
-                            st.image(file_bytes, width='stretch')
+                            st.image(file_bytes, use_container_width=True)
                         with col2:
                             st.markdown('<div class="section-header">Redacted (Black Box)</div>', unsafe_allow_html=True)
-                            st.image(sanitized_bytes, width='stretch')
+                            st.image(sanitized_bytes, use_container_width=True)
 
                     # PII breakdown
                     st.markdown('<div class="section-header">PII Breakdown</div>', unsafe_allow_html=True)
@@ -814,7 +814,7 @@ def page_upload():
 
                         df = pd.DataFrame(detections)[["pii_type", "original_value", "masked_value", "detection_method"]]
                         df.columns = ["Type", "Original", "Masked As", "Method"]
-                        st.dataframe(df, width='stretch', hide_index=True)
+                        st.dataframe(df, use_container_width=True, hide_index=True)
 
                     # Download button
                     dl_name = f"sanitized_{uploaded.name}"
@@ -825,7 +825,7 @@ def page_upload():
                         data=sanitized_bytes,
                         file_name=dl_name,
                         mime=dl_mime,
-                        width='stretch'
+                        use_container_width=True
                     )
 
                 except Exception as e:
@@ -865,7 +865,7 @@ def page_audit_logs():
     if user_filter != "All":
         filtered = filtered[filtered["User"] == user_filter]
 
-    st.dataframe(filtered, width='stretch', hide_index=True)
+    st.dataframe(filtered, use_container_width=True, hide_index=True)
 
     # ── SIEM Export ──────────────────────────────────────────────
     st.markdown('<div class="section-header">Export Logs</div>', unsafe_allow_html=True)
@@ -878,7 +878,7 @@ def page_audit_logs():
             data=siem_data,
             file_name=f"pii_sanitizer_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.ndjson",
             mime="application/x-ndjson",
-            width='stretch',
+            use_container_width=True,
             help="Compatible with Splunk, ELK, IBM QRadar"
         )
     with col_e2:
@@ -890,7 +890,7 @@ def page_audit_logs():
             data=raw_json,
             file_name=f"pii_sanitizer_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json",
-            width='stretch'
+            use_container_width=True
         )
 
 
@@ -979,7 +979,7 @@ def page_users():
             df_files = pd.DataFrame(user_files)[["original_filename", "file_type", "pii_count", "status", "upload_time"]]
             df_files.columns = ["Filename", "Type", "PII Count", "Status", "Uploaded At"]
             df_files["Uploaded At"] = pd.to_datetime(df_files["Uploaded At"]).dt.strftime("%Y-%m-%d %H:%M")
-            st.dataframe(df_files, width='stretch', hide_index=True)
+            st.dataframe(df_files, use_container_width=True, hide_index=True)
         return
 
     # ── User list with click to inspect ──────────────────────────
@@ -1035,7 +1035,7 @@ def page_users():
             new_password = st.text_input("Password", type="password")
             new_role     = st.selectbox("Role", ["standard", "admin"])
 
-        if st.form_submit_button("Create User", width='stretch'):
+        if st.form_submit_button("Create User", use_container_width=True):
             try:
                 create_user(new_username, new_email, new_password, new_role)
                 st.success(f"User '{new_username}' created successfully!")
@@ -1074,13 +1074,13 @@ Passport: U5529981, Aadhaar: 6652 4811 9073
 IP Address: 103.54.12.77, Device: android-9f31acb8d1"""
 
     with col1:
-        if st.button("👤 Indian PII Sample", width='stretch'):
+        if st.button("👤 Indian PII Sample", use_container_width=True):
             st.session_state["text_input"] = sample_indian
     with col2:
-        if st.button("💳 Card Data Sample", width='stretch'):
+        if st.button("💳 Card Data Sample", use_container_width=True):
             st.session_state["text_input"] = sample_card
     with col3:
-        if st.button("🏢 Employee Record", width='stretch'):
+        if st.button("🏢 Employee Record", use_container_width=True):
             st.session_state["text_input"] = sample_employee
 
     st.markdown('<div class="section-header">Input Text</div>', unsafe_allow_html=True)
@@ -1101,7 +1101,7 @@ IP Address: 103.54.12.77, Device: android-9f31acb8d1"""
     with col_o2:
         mask_mode = st.selectbox("Mask Mode", ["Partial (j***@email.com)", "Full Redact ([REDACTED])", "Token (PII_TOKEN_1)"], label_visibility="collapsed")
 
-    if st.button("🔍 Scan & Mask PII", width='stretch', disabled=not input_text.strip()):
+    if st.button("🔍 Scan & Mask PII", use_container_width=True, disabled=not input_text.strip()):
         if not input_text.strip():
             st.warning("Please enter some text first.")
             return
@@ -1169,7 +1169,7 @@ IP Address: 103.54.12.77, Device: android-9f31acb8d1"""
         if all_detections:
             df = pd.DataFrame(all_detections)[["pii_type", "original_value", "masked_value", "detection_method"]]
             df.columns = ["Type", "Original", "Masked As", "Method"]
-            st.dataframe(df, width='stretch', hide_index=True)
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
         # Download sanitized text
         st.download_button(
@@ -1177,7 +1177,7 @@ IP Address: 103.54.12.77, Device: android-9f31acb8d1"""
             data=masked_text,
             file_name="sanitized_text.txt",
             mime="text/plain",
-            width='stretch'
+            use_container_width=True
         )
 
         # Log action
@@ -1226,7 +1226,7 @@ def page_my_files():
             st.markdown(f"🔴 **{pii_count} PII**")
         with col3:
             if status == "done":
-                if st.button("👁️ Preview", key=f"prev_my_{f['id']}", width='stretch'):
+                if st.button("👁️ Preview", key=f"prev_my_{f['id']}", use_container_width=True):
                     st.session_state["preview_file_id"] = str(f["id"])
                     st.session_state["preview_from"] = "my_files"
                     st.rerun()
@@ -1254,7 +1254,7 @@ def page_my_files():
                     data=sanitized_bytes,
                     file_name=f"sanitized_{f['original_filename']}",
                     mime=get_content_type(f["original_filename"]),
-                    width='stretch',
+                    use_container_width=True,
                     key=f"dl_my_prev_{fid}"
                 )
             except Exception as e:
@@ -1274,7 +1274,7 @@ def page_change_password():
         new_pw      = st.text_input("New Password", type="password")
         confirm_pw  = st.text_input("Confirm New Password", type="password")
 
-        submitted = st.form_submit_button("🔒 Update Password", width='stretch')
+        submitted = st.form_submit_button("🔒 Update Password", use_container_width=True)
 
         if submitted:
             if not current_pw or not new_pw or not confirm_pw:
