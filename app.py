@@ -714,55 +714,96 @@ def page_upload():
             st.session_state[_fkey] = uploaded.read()
         file_bytes = st.session_state[_fkey]
         ext = uploaded.name.rsplit(".", 1)[-1].lower()
+        size_mb = len(file_bytes) / 1024 / 1024
+
+        # ── Cache original preview once — avoid re-parsing on reruns ──
+        _pvkey = f"preview__{uploaded.name}__{uploaded.size}"
+        if _pvkey not in st.session_state:
+            if ext in ("png", "jpg", "jpeg"):
+                st.session_state[_pvkey] = None  # images shown directly
+            else:
+                st.session_state[_pvkey] = extract_preview_text(file_bytes, uploaded.name, max_chars=1500)
+
+        orig_preview = st.session_state[_pvkey]
 
         # ── Show original preview ─────────────────────────────────
         st.markdown('<div class="section-header">Original Preview</div>', unsafe_allow_html=True)
         if ext in ("png", "jpg", "jpeg"):
-            st.image(file_bytes, caption="Uploaded image", use_column_width=True)
+            st.image(file_bytes, caption="Uploaded image", use_container_width=True)
         else:
-            preview = extract_preview_text(file_bytes, uploaded.name, max_chars=1500)
-            st.markdown(f'<div class="diff-original">{preview}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="diff-original">{orig_preview}</div>', unsafe_allow_html=True)
 
-        size_mb = len(file_bytes) / 1024 / 1024
+        # ── SECURITY SCAN first (always, before PII processing) ──────
+        _seckey = f"sec__{uploaded.name}__{uploaded.size}"
+        if _seckey not in st.session_state:
+            with st.spinner("🛡️ Running security scan..."):
+                sec_result = full_security_scan(file_bytes, uploaded.name)
+                st.session_state[_seckey] = sec_result
 
-        # ── START SCAN IMMEDIATELY on upload (no button needed) ───
-        # Uses st.cache_data so re-renders don't re-run the scan.
-        # Navigation / sign-out works because Streamlit can rerun
-        # freely — the cached result is returned instantly.
+        sec_result = st.session_state[_seckey]
+
+        if not sec_result["safe"]:
+            threats = sec_result["malicious_content"]["threats"]
+            details = sec_result["malicious_content"]["details"]
+            st.error("🚨 **Security threat detected — file blocked from processing.**")
+            st.markdown(f"**Threat types found:** `{'`**, **`'.join(threats)}`")
+            for threat_type, matches in details.items():
+                with st.expander(f"🔍 {threat_type} details"):
+                    for m in matches[:5]:
+                        st.code(str(m))
+            st.warning("⚠️ This file has been flagged and will not be sanitized or saved. Contact your administrator.")
+            log_action(current_user()["id"], "security_threat_blocked",
+                       details={"filename": uploaded.name, "threats": threats})
+            st.stop()
+
+        st.success(f"🛡️ Security scan passed — SHA256: `{sec_result['hashes']['sha256'][:16]}…`")
+
+        # ── PII SCAN (only reached if security scan passed) ────────
         _rkey = f"result__{uploaded.name}__{uploaded.size}"
 
         if _rkey not in st.session_state:
-            # Show a blocking spinner ONLY on first upload
-            # (subsequent reruns hit cache and return instantly)
-            with st.spinner(f"🔍 Scanning {size_mb:.1f} MB for PII — this may take a few seconds..."):
-                try:
-                    sanitized_bytes, detections, pii_summary = process_file(file_bytes, uploaded.name)
-                    st.session_state[_rkey] = {
-                        "sanitized_bytes": sanitized_bytes,
-                        "detections":      detections,
-                        "pii_summary":     pii_summary,
-                    }
-                except Exception as e:
-                    st.error(f"❌ Scan failed: {e}")
-                    st.stop()
+            # Show progress steps so user knows something is happening
+            prog = st.empty()
+            prog.info(f"⏳ Processing {size_mb:.1f} MB — Step 1/3: Parsing file...")
+            try:
+                import time
+                t0 = time.time()
+                sanitized_bytes, detections, pii_summary = process_file(file_bytes, uploaded.name)
+                elapsed = time.time() - t0
+                # Cache sanitized preview separately — extract_preview_text is slow on large bytes
+                san_preview = extract_preview_text(sanitized_bytes, uploaded.name, max_chars=1500)
+                prog.empty()
+                st.session_state[_rkey] = {
+                    "sanitized_bytes": sanitized_bytes,
+                    "detections":      detections,
+                    "pii_summary":     pii_summary,
+                    "san_preview":     san_preview,
+                    "elapsed":         elapsed,
+                }
+            except Exception as e:
+                prog.empty()
+                st.error(f"❌ Scan failed: {e}")
+                st.stop()
 
         # ── Results always read from session_state ────────────────
         _r              = st.session_state[_rkey]
         sanitized_bytes = _r["sanitized_bytes"]
         detections      = _r["detections"]
         pii_summary     = _r["pii_summary"]
+        san_preview     = _r["san_preview"]
+        elapsed         = _r.get("elapsed", 0)
 
-        st.success(f"✅ Scan complete — **{len(detections):,} PII items** found in {size_mb:.1f} MB file.")
+        st.success(f"✅ Scan complete — **{len(detections):,} PII items** masked in {elapsed:.1f}s")
 
-        # ── Before / After preview (first 1500 chars only) ────────
+        # ── Before / After preview ────────────────────────────────
         if ext not in ("png", "jpg", "jpeg"):
             col1, col2 = st.columns(2)
             with col1:
                 st.markdown('<div class="section-header">Original (preview)</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="diff-original">{extract_preview_text(file_bytes, uploaded.name, 1500)}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="diff-original">{orig_preview}</div>', unsafe_allow_html=True)
             with col2:
                 st.markdown('<div class="section-header">Sanitized (preview)</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="diff-sanitized">{extract_preview_text(sanitized_bytes, uploaded.name, 1500)}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="diff-sanitized">{san_preview}</div>', unsafe_allow_html=True)
         else:
             col1, col2 = st.columns(2)
             with col1:
@@ -778,13 +819,16 @@ def page_upload():
             chips = "".join([f'<span class="pii-chip">{k}: {v}</span>' for k, v in pii_summary.items()])
             st.markdown(f'<div>{chips}</div>', unsafe_allow_html=True)
 
-            # Cap table at 500 rows — 120k rows crashes the browser
-            _preview_dets = detections[:500]
-            df = pd.DataFrame(_preview_dets)[["pii_type", "original_value", "masked_value", "detection_method"]]
-            df.columns = ["Type", "Original", "Masked As", "Method"]
+            # Cap table at 200 rows and drop original_value for large files — avoids browser freeze
+            _cap = 200 if size_mb > 5 else 500
+            _preview_dets = detections[:_cap]
+            _cols = ["pii_type", "masked_value", "detection_method"] if size_mb > 5 else ["pii_type", "original_value", "masked_value", "detection_method"]
+            _labels = ["Type", "Masked As", "Method"] if size_mb > 5 else ["Type", "Original", "Masked As", "Method"]
+            df = pd.DataFrame(_preview_dets)[_cols]
+            df.columns = _labels
             st.dataframe(df, use_container_width=True, hide_index=True)
-            if len(detections) > 500:
-                st.caption(f"Showing 500 of {len(detections):,} detections — download the file to see all.")
+            if len(detections) > _cap:
+                st.caption(f"Showing {_cap} of {len(detections):,} detections — download the sanitized file to see full output.")
 
         # ── Save to DB ────────────────────────────────────────────
         _saved_key = f"saved__{uploaded.name}__{uploaded.size}"
