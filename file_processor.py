@@ -1,11 +1,15 @@
 """
 file_processor.py — High-performance PII detection and sanitization
 Optimized for 20MB+ files:
-  - Single-pass combined regex substitution (no repeated str.replace)
+  - Single-pass hint-gated regex substitution
   - Parallel processing for PDF pages and DOCX paragraphs
   - Chunked streaming for large TXT/SQL files
   - Column-batch CSV processing
   - Pre-compiled patterns at module load
+
+Fix: DOCX embedded-image redaction now uses a proper two-step ZIP rebuild
+     (save doc first → reopen ZIP → write new ZIP → close → getvalue)
+     so the ZIP central directory is fully written before bytes are read.
 """
 import io
 import zipfile
@@ -23,9 +27,9 @@ from PIL import Image, ImageDraw
 from pii_engine import build_pii_summary, REGEX_PATTERNS, name_address_scan
 
 # ── CONFIG ────────────────────────────────────────────────────────
-MAX_WORKERS   = 8       # parallel threads for PDF/DOCX
-CHUNK_SIZE    = 500_000 # bytes per chunk for TXT/SQL streaming
-OVERLAP       = 200     # overlap between chunks to avoid splitting PII at boundary
+MAX_WORKERS = 8        # parallel threads for PDF/DOCX
+CHUNK_SIZE  = 500_000  # bytes per chunk for TXT/SQL streaming
+OVERLAP     = 200      # overlap between chunks to avoid splitting PII at boundary
 
 # ── PRE-COMPILE EVERYTHING ONCE AT MODULE LOAD ───────────────────
 def _clean_pattern(p):
@@ -38,31 +42,30 @@ _COMPILED_EACH = {
 }
 
 # Hint functions — fast str/re checks to skip patterns that can't match
-# Each hint costs ~0.001s; running a full pattern costs ~0.2s on 10MB
 _HINTS = {
-    "aadhaar":        lambda t: bool(re.search(r'\d{4} \d{4}', t[:500] if len(t)>500 else t)),
+    "aadhaar":        lambda t: bool(re.search(r'\d{4} \d{4}', t[:500] if len(t) > 500 else t)),
     "us_phone":       lambda t: "(" in t or "+1" in t,
     "email":          lambda t: "@" in t,
     "ip_address":     lambda t: t.count(".") > 5,
-    "passport":       lambda t: bool(re.search(r'[A-Z]\d{7}', t[:500] if len(t)>500 else t)),
-    "ifsc":           lambda t: bool(re.search(r'[A-Z]{4}0', t[:500] if len(t)>500 else t)),
-    "upi":            lambda t: "@" in t and any(x in t.lower() for x in ("upi","ybl","okaxis","paytm")),
-    "credit_card":    lambda t: bool(re.search(r'\d{4}[ -]\d{4}', t[:500] if len(t)>500 else t)),
+    "passport":       lambda t: bool(re.search(r'[A-Z]\d{7}', t[:500] if len(t) > 500 else t)),
+    "ifsc":           lambda t: bool(re.search(r'[A-Z]{4}0', t[:500] if len(t) > 500 else t)),
+    "upi":            lambda t: "@" in t and any(x in t.lower() for x in ("upi", "ybl", "okaxis", "paytm")),
+    "credit_card":    lambda t: bool(re.search(r'\d{4}[ -]\d{4}', t[:500] if len(t) > 500 else t)),
     "cvv":            lambda t: "cvv" in t.lower(),
     "expiry_date":    lambda t: "/" in t,
     "device_id":      lambda t: "android" in t.lower() or "ios" in t.lower(),
     "fingerprint":    lambda t: "fp_hash" in t,
     "face_template":  lambda t: "face_tmp" in t,
-    "dob":            lambda t: bool(re.search(r'\d{2}[/-]\d{2}[/-]\d{4}', t[:500] if len(t)>500 else t)),
+    "dob":            lambda t: bool(re.search(r'\d{2}[/-]\d{2}[/-]\d{4}', t[:500] if len(t) > 500 else t)),
     "pincode":        lambda t: "pin" in t.lower() or "zip" in t.lower(),
-    "vehicle_number": lambda t: bool(re.search(r'\b[A-Z]{2}\d{2}[A-Z]', t[:500] if len(t)>500 else t)),
-    "voter_id":       lambda t: bool(re.search(r'\b[A-Z]{3}\d{7}', t[:500] if len(t)>500 else t)),
-    "gstin":          lambda t: bool(re.search(r'\b\d{2}[A-Z]{5}\d{4}', t[:500] if len(t)>500 else t)),
-    "swift_code":     lambda t: "swift" in t.lower() or "bic" in t.lower(),
-    "account_number": lambda t: bool(re.search(r'\d{9,18}', t[:500] if len(t)>500 else t)),
+    "vehicle_number": lambda t: bool(re.search(r'\b[A-Z]{2}\d{2}[A-Z]', t[:500] if len(t) > 500 else t)),
+    "voter_id":       lambda t: bool(re.search(r'\b[A-Z]{3}\d{7}', t[:500] if len(t) > 500 else t)),
+    "gstin":          lambda t: bool(re.search(r'\b\d{2}[A-Z]{5}\d{4}', t[:500] if len(t) > 500 else t)),
+    "swift_code":     lambda t: "swift" in t.lower() or "bic" in t.lower() or "iban" in t.lower(),
+    "account_number": lambda t: bool(re.search(r'\d{9,18}', t[:500] if len(t) > 500 else t)),
 }
 
-# Keep _PATTERN_LIST and _GROUP_MAP/_COMBINED for image processing (still used there)
+# Combined regex — still used for image OCR token matching
 _PATTERN_LIST = list(REGEX_PATTERNS.items())
 _GROUP_MAP    = {}
 _parts        = []
@@ -90,7 +93,7 @@ _ADDRESS = re.compile(
 )
 
 
-# ── CORE: single-pass scan ────────────────────────────────────────
+# ── CORE: single-pass hint-gated scan ────────────────────────────
 
 def _single_pass_scan(text: str) -> tuple:
     """
@@ -104,36 +107,56 @@ def _single_pass_scan(text: str) -> tuple:
     for pii_type, (pat, masker) in _COMPILED_EACH.items():
         hint = _HINTS.get(pii_type)
         if hint and not hint(masked):
-            continue   # fast skip — pattern can't match, save ~0.2s
+            continue
         found = []
+
         def _replace(m, _pt=pii_type, _mk=masker, _f=found):
             v = m.group()
-            try: mv = _mk(v)
-            except: mv = "[REDACTED]"
+            try:
+                mv = _mk(v)
+            except Exception:
+                mv = "[REDACTED]"
             _f.append({"pii_type": _pt, "original_value": v,
                        "masked_value": mv, "detection_method": "regex", "confidence": 1.0})
             return mv
+
         masked = pat.sub(_replace, masked)
         detections.extend(found)
 
-    # Name pass — only if file has name-like content
-    if any(kw in masked for kw in ("Name:", "name:", "customer", "Customer", "patient", "Mr.", "Dr.")):
-        for match in _NAME_LABELED.finditer(masked):
-            name_val = match.group(1)
-            if name_val and len(name_val.strip()) > 2:
-                detections.append({"pii_type": "name", "original_value": name_val.strip(),
-                                   "masked_value": "[NAME REDACTED]", "detection_method": "pattern", "confidence": 0.9})
-                masked = masked.replace(name_val.strip(), "[NAME REDACTED]", 1)
-        for match in _NAME_TITLED.finditer(masked):
-            name_val = match.group(1)
-            if name_val and len(name_val.strip()) > 2:
-                detections.append({"pii_type": "name", "original_value": name_val.strip(),
-                                   "masked_value": "[NAME REDACTED]", "detection_method": "pattern", "confidence": 0.9})
-                masked = masked.replace(name_val.strip(), "[NAME REDACTED]", 1)
+    # ── Name pass (4 complementary patterns) ─────────────────────
+    from pii_engine import (NAME_PATTERN, NAME_TITLED, NAME_VERB_PREFIX,
+                             NAME_TITLE_PAIR, _NAME_COMMON_WORDS)
 
-    # Address pass — only if address keywords present
+    def _add_name(masked, name_val, method, conf=0.9):
+        name_val = name_val.strip()
+        if len(name_val) > 2 and "[NAME REDACTED]" not in name_val:
+            detections.append({"pii_type": "name", "original_value": name_val,
+                               "masked_value": "[NAME REDACTED]",
+                               "detection_method": method, "confidence": conf})
+            masked = masked.replace(name_val, "[NAME REDACTED]", 1)
+        return masked
+
+    # 1. Labeled
+    if any(kw in masked for kw in ("Name:", "name:", "customer", "Customer",
+                                    "patient", "employee", "client", "member")):
+        for m in NAME_PATTERN.finditer(masked):
+            masked = _add_name(masked, m.group(1), "pattern-labeled")
+    # 2. Titled
+    for m in NAME_TITLED.finditer(masked):
+        masked = _add_name(masked, m.group(1), "pattern-titled")
+    # 3. Verb-prefixed
+    for m in NAME_VERB_PREFIX.finditer(masked):
+        masked = _add_name(masked, m.group(1), "pattern-verb", conf=0.88)
+    # 4. Standalone Title-Case pair
+    for m in NAME_TITLE_PAIR.finditer(masked):
+        first, last = m.group(1), m.group(2)
+        if first not in _NAME_COMMON_WORDS and last not in _NAME_COMMON_WORDS:
+            masked = _add_name(masked, f"{first} {last}", "pattern-titlecase", conf=0.82)
+
+    # ── Address pass ──────────────────────────────────────────────
+    from pii_engine import ADDRESS_PATTERN as _ADDR_PAT
     if any(kw in masked for kw in ("Road", "Street", "Nagar", "Colony", "Sector", "Phase", "Block")):
-        for match in _ADDRESS.finditer(masked):
+        for match in _ADDR_PAT.finditer(masked):
             addr = match.group().strip()
             if len(addr) > 10:
                 parts = [p.strip() for p in addr.split(",")]
@@ -161,13 +184,11 @@ def _chunked_scan(text: str) -> tuple:
     if len(text) <= CHUNK_SIZE:
         return _single_pass_scan(text)
 
-    # Split into chunks with overlap so PII on boundaries isn't missed
     chunks = []
     starts = []
     i = 0
     while i < len(text):
         end = min(i + CHUNK_SIZE, len(text))
-        # Try to break at newline for cleaner chunks
         if end < len(text):
             newline = text.rfind('\n', i + CHUNK_SIZE - OVERLAP, end)
             if newline > i:
@@ -176,7 +197,6 @@ def _chunked_scan(text: str) -> tuple:
         starts.append(i)
         i = end - OVERLAP if end < len(text) else end
 
-    # Process chunks in parallel
     results = [None] * len(chunks)
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(_single_pass_scan, chunk): idx
@@ -185,15 +205,12 @@ def _chunked_scan(text: str) -> tuple:
             idx = futures[future]
             results[idx] = future.result()
 
-    # Stitch: use non-overlapping portions
     all_detections = []
     stitched = []
     for idx, (masked_chunk, dets) in enumerate(results):
         all_detections.extend(dets)
         if idx < len(results) - 1:
-            # Drop the overlap tail to avoid duplicates
-            stitched.append(masked_chunk[:-OVERLAP] if len(masked_chunk) > OVERLAP
-                            else masked_chunk)
+            stitched.append(masked_chunk[:-OVERLAP] if len(masked_chunk) > OVERLAP else masked_chunk)
         else:
             stitched.append(masked_chunk)
 
@@ -223,6 +240,7 @@ def process_file(file_bytes: bytes, filename: str) -> tuple:
 # ── IMAGE ─────────────────────────────────────────────────────────
 
 _nlp = None
+
 def _get_nlp():
     global _nlp
     if _nlp is None:
@@ -255,7 +273,6 @@ def _process_image(file_bytes: bytes, ext: str = "png") -> tuple:
 
         full_text = " ".join(word for word in d["text"] if word.strip())
 
-        # Normalize digit runs (Tesseract reads "67890123" instead of "6789 0123")
         def _norm(t):
             t = re.sub(r'\b(\d{4})(\d{4})(\d{4})\b', r'\1 \2 \3', t)
             t = re.sub(r'\b(\d{4})(\d{4})\b', r'\1 \2', t)
@@ -263,10 +280,12 @@ def _process_image(file_bytes: bytes, ext: str = "png") -> tuple:
 
         norm_text = _norm(full_text)
 
-        # Build target token set
-        targets = set()
+        # pii_substrings: all lowercased token variants of detected PII values.
+        # We store both the space-split tokens AND the fully-merged (no-space) form
+        # so we can match regardless of whether OCR returned "1234 5678 9012" or
+        # "123456789012" for the same Aadhaar number.
+        pii_substrings = set()
 
-        # Label words that should NEVER be redacted — only values get masked
         _LABEL_WORDS = {
             'name', 'pan', 'phone', 'aadhaar', 'aadhar', 'email', 'dob',
             'address', 'account', 'ifsc', 'upi', 'gstin', 'passport',
@@ -276,47 +295,61 @@ def _process_image(file_bytes: bytes, ext: str = "png") -> tuple:
             'by', 'the', 'and', 'for', 'ref', 'to', 'of', 'in', 'at',
         }
 
-        # Structured PII — extract ONLY the actual PII value tokens, never label words
-        # e.g. "PAN: WERTY4321P" -> add only "werty4321p", not "pan"
+        from pii_engine import (NAME_PATTERN as _NP, NAME_TITLED as _NT,
+                                 NAME_VERB_PREFIX as _NVP, NAME_TITLE_PAIR as _NTP,
+                                 _NAME_COMMON_WORDS as _NCW)
+
+        def _add_pii_value(val):
+            """Register all token variants of a PII value into pii_substrings."""
+            clean_val = re.sub(r'^[^a-zA-Z0-9@+]|[^a-zA-Z0-9@.]$', '', val)
+            # 1. Fully merged (no spaces) — catches OCR that runs digits together
+            merged = re.sub(r'\s+', '', clean_val).lower()
+            if merged and len(merged) > 2:
+                pii_substrings.add(merged)
+                # 2. For purely numeric values (e.g. Aadhaar "1234 5678 9012"),
+                #    also store ALL contiguous sub-groups OCR might split on:
+                #    4+8, 8+4, 4+4+4, etc.  We do this by sliding a window over
+                #    the digit string and storing every prefix/suffix of length ≥ 4.
+                if merged.isdigit():
+                    digs = merged
+                    for start in range(0, len(digs)):
+                        for end in range(start + 4, len(digs) + 1):
+                            pii_substrings.add(digs[start:end])
+            # 3. Per-whitespace-token — handles OCR that does split on spaces
+            for token in clean_val.split():
+                clean = re.sub(r'^[^a-zA-Z0-9@+]|[^a-zA-Z0-9@.]$', '', token).lower()
+                if clean and clean not in _LABEL_WORDS and len(clean) > 2:
+                    pii_substrings.add(clean)
+
         for match in _COMBINED.finditer(norm_text):
             for group_name, (pii_type, masker) in _GROUP_MAP.items():
                 val = match.group(group_name)
                 if val is not None:
-                    for token in val.split():
-                        clean = re.sub(r'^[^a-zA-Z0-9@+]|[^a-zA-Z0-9@.]$', '', token).lower()
-                        # Skip if it's a label word OR if it looks like a label
-                        # (short word, no digits, matches known field names)
-                        if clean and clean not in _LABEL_WORDS and len(clean) > 2:
-                            targets.add(clean)
+                    _add_pii_value(val)
                     break
 
-        # Labeled names
-        for match in _NAME_LABELED.finditer(full_text):
+        for match in _NP.finditer(full_text):
             name_val = match.group(1)
             if name_val:
-                for token in name_val.strip().split():
-                    clean = re.sub(r'^[^a-zA-Z0-9@+]|[^a-zA-Z0-9@.]$', '', token).lower()
-                    if len(clean) > 2:
-                        targets.add(clean)
+                _add_pii_value(name_val.strip())
 
-        # Titled names
-        for match in _NAME_TITLED.finditer(full_text):
-            for token in match.group(1).split():
-                clean = re.sub(r'^[^a-zA-Z0-9@+]|[^a-zA-Z0-9@.]$', '', token).lower()
-                if len(clean) > 2:
-                    targets.add(clean)
+        for match in _NT.finditer(full_text):
+            _add_pii_value(match.group(1))
 
-        # spaCy (optional)
+        for match in _NVP.finditer(full_text):
+            _add_pii_value(match.group(1))
+
+        for match in _NTP.finditer(full_text):
+            first, last = match.group(1), match.group(2)
+            if first not in _NCW and last not in _NCW:
+                _add_pii_value(f"{first} {last}")
+
         nlp = _get_nlp()
         if nlp:
             for ent in nlp(full_text).ents:
                 if ent.label_ in ["PERSON", "GPE"]:
-                    for token in ent.text.split():
-                        clean = re.sub(r'^[^a-zA-Z0-9@+]|[^a-zA-Z0-9@.]$', '', token).lower()
-                        if len(clean) > 2:
-                            targets.add(clean)
+                    _add_pii_value(ent.text)
 
-        # Build detections
         all_detections = []
         for match in _COMBINED.finditer(norm_text):
             for group_name, (pii_type, masker) in _GROUP_MAP.items():
@@ -332,29 +365,48 @@ def _process_image(file_bytes: bytes, ext: str = "png") -> tuple:
                         "detection_method": "regex+ocr", "confidence": 1.0
                     })
                     break
-        for match in _NAME_LABELED.finditer(full_text):
+
+        for match in _NP.finditer(full_text):
             name_val = match.group(1)
             if name_val:
-                all_detections.append({
-                    "pii_type": "name", "original_value": name_val.strip(),
-                    "masked_value": "[NAME REDACTED]",
-                    "detection_method": "pattern+ocr", "confidence": 0.9
-                })
+                all_detections.append({"pii_type": "name", "original_value": name_val.strip(),
+                                       "masked_value": "[NAME REDACTED]",
+                                       "detection_method": "pattern+ocr", "confidence": 0.9})
+        for match in _NT.finditer(full_text):
+            all_detections.append({"pii_type": "name", "original_value": match.group(1).strip(),
+                                   "masked_value": "[NAME REDACTED]",
+                                   "detection_method": "pattern+ocr", "confidence": 0.9})
+        for match in _NVP.finditer(full_text):
+            all_detections.append({"pii_type": "name", "original_value": match.group(1).strip(),
+                                   "masked_value": "[NAME REDACTED]",
+                                   "detection_method": "pattern+ocr", "confidence": 0.88})
+        for match in _NTP.finditer(full_text):
+            first, last = match.group(1), match.group(2)
+            if first not in _NCW and last not in _NCW:
+                all_detections.append({"pii_type": "name", "original_value": f"{first} {last}",
+                                       "masked_value": "[NAME REDACTED]",
+                                       "detection_method": "pattern+ocr", "confidence": 0.82})
 
-        # Draw black boxes
+        # Draw black boxes over detected PII tokens.
+        # We match each OCR word in two ways:
+        #   1. Exact match: clean_word is directly in pii_substrings
+        #   2. Merged match: strip all spaces from clean_word and check again
+        #      (catches cases where OCR returned "123456789012" but PII was
+        #       detected as "1234 5678 9012" whose merged form "123456789012" is stored)
         for i in range(n):
             word = d["text"][i].strip()
             if not word:
                 continue
             clean_word = re.sub(r'^[^a-zA-Z0-9@+]|[^a-zA-Z0-9@.]$', '', word).lower()
-            if clean_word in targets:
+            merged_word = re.sub(r'\s+', '', clean_word)
+            if clean_word in pii_substrings or merged_word in pii_substrings:
                 x, y, ww, hh = d["left"][i], d["top"][i], d["width"][i], d["height"][i]
                 if ww > 0 and hh > 0:
                     sx  = int(x  * scale_x)
                     sy  = int(y  * scale_y)
                     sww = int(ww * scale_x)
                     shh = int(hh * scale_y)
-                    draw.rectangle([sx-2, sy-2, sx+sww+2, sy+shh+2], fill="black")
+                    draw.rectangle([sx - 2, sy - 2, sx + sww + 2, sy + shh + 2], fill="black")
 
         out = io.BytesIO()
         image.save(out, format="JPEG" if ext in ("jpg", "jpeg") else "PNG")
@@ -364,8 +416,8 @@ def _process_image(file_bytes: bytes, ext: str = "png") -> tuple:
         image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
         draw = ImageDraw.Draw(image)
         iw, ih = image.size
-        draw.rectangle([0, ih//2 - 40, iw, ih//2 + 40], fill=(150, 0, 0))
-        draw.text((20, ih//2 - 15), "Install tesseract for OCR redaction", fill="white")
+        draw.rectangle([0, ih // 2 - 40, iw, ih // 2 + 40], fill=(150, 0, 0))
+        draw.text((20, ih // 2 - 15), "Install tesseract for OCR redaction", fill="white")
         out = io.BytesIO()
         image.save(out, format="PNG")
         return out.getvalue(), [], {}
@@ -377,15 +429,12 @@ def _process_image(file_bytes: bytes, ext: str = "png") -> tuple:
 # ── PDF ───────────────────────────────────────────────────────────
 
 def _process_pdf(file_bytes: bytes) -> tuple:
-    # Extract all pages first
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         page_texts = [page.extract_text() or "" for page in pdf.pages]
 
-    # Process all pages in parallel
     results = [None] * len(page_texts)
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(page_texts)))) as ex:
-        futures = {ex.submit(_single_pass_scan, txt): i
-                   for i, txt in enumerate(page_texts)}
+        futures = {ex.submit(_single_pass_scan, txt): i for i, txt in enumerate(page_texts)}
         for future in as_completed(futures):
             results[futures[future]] = future.result()
 
@@ -395,7 +444,6 @@ def _process_pdf(file_bytes: bytes) -> tuple:
         all_detections.extend(dets)
         full_masked_text += masked + "\n\n"
 
-    # Rebuild PDF
     out = io.BytesIO()
     doc = SimpleDocTemplate(out, pagesize=A4)
     styles = getSampleStyleSheet()
@@ -414,34 +462,44 @@ def _process_pdf(file_bytes: bytes) -> tuple:
 
 def _redact_images_in_docx_zip(docx_bytes: bytes) -> tuple:
     """
-    DOCX files are ZIP archives. This function opens the ZIP,
-    finds every image in word/media/, runs OCR redaction on it,
-    and writes the redacted image back — all without touching the XML structure.
+    Open the DOCX ZIP, OCR-redact every image in word/media/,
+    write a new ZIP with the redacted images, and return its bytes.
+
+    BUG FIX: The output BytesIO buffer is only valid AFTER the ZipFile
+    is fully closed (so its central directory is flushed).  We therefore
+    close the writer first, then call getvalue() — never inside the
+    'with' block.
     """
     IMG_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif', '.webp'}
     all_detections = []
 
-    src_zip = zipfile.ZipFile(io.BytesIO(docx_bytes), 'r')
-    out_buf = io.BytesIO()
-    out_zip = zipfile.ZipFile(out_buf, 'w', compression=zipfile.ZIP_DEFLATED)
+    # --- read phase ---
+    with zipfile.ZipFile(io.BytesIO(docx_bytes), 'r') as src_zip:
+        items = src_zip.infolist()
+        file_data = {item.filename: src_zip.read(item.filename) for item in items}
 
-    for item in src_zip.infolist():
-        data = src_zip.read(item.filename)
-        fname_lower = item.filename.lower()
-
+    # --- redact images ---
+    redacted_data = {}
+    for filename, data in file_data.items():
+        fname_lower = filename.lower()
         if fname_lower.startswith('word/media/') and any(fname_lower.endswith(e) for e in IMG_EXTS):
             ext = fname_lower.rsplit('.', 1)[-1]
             try:
                 redacted_bytes, detections, _ = _process_image(data, ext)
                 all_detections.extend(detections)
-                data = redacted_bytes
+                redacted_data[filename] = redacted_bytes
             except Exception as e:
-                print(f"[DOCX image error] {item.filename}: {e}")
+                print(f"[DOCX image error] {filename}: {e}")
+                redacted_data[filename] = data  # keep original on failure
+        else:
+            redacted_data[filename] = data
 
-        out_zip.writestr(item, data)
-
-    src_zip.close()
-    out_zip.close()
+    # --- write phase: close BEFORE getvalue() ---
+    out_buf = io.BytesIO()
+    with zipfile.ZipFile(out_buf, 'w', compression=zipfile.ZIP_DEFLATED) as out_zip:
+        for item in items:
+            out_zip.writestr(item, redacted_data[item.filename])
+    # out_zip is now closed → central directory is written → getvalue() is safe
     return out_buf.getvalue(), all_detections
 
 
@@ -452,11 +510,11 @@ def _process_docx(file_bytes: bytes) -> tuple:
     try:
         img_docx_bytes, img_detections = _redact_images_in_docx_zip(file_bytes)
         all_detections.extend(img_detections)
-        file_bytes = img_docx_bytes  # work on image-redacted version
+        file_bytes = img_docx_bytes  # continue with image-redacted bytes
     except Exception as e:
         print(f"[DOCX image pass error] {e}")
 
-    # ── Step 2: Redact text in paragraphs and tables ──────────────
+    # ── Step 2: Redact text in paragraphs and tables in parallel ──
     doc = Document(io.BytesIO(file_bytes))
 
     para_list = list(doc.paragraphs)
@@ -494,7 +552,7 @@ def _process_docx(file_bytes: bytes) -> tuple:
 
 def _process_text(file_bytes: bytes) -> tuple:
     text = file_bytes.decode("utf-8", errors="replace")
-    masked, detections = _chunked_scan(text)  # chunked + parallel for 20MB+
+    masked, detections = _chunked_scan(text)
     return masked.encode("utf-8"), detections, build_pii_summary(detections)
 
 
@@ -523,7 +581,6 @@ def _process_csv(file_bytes: bytes) -> tuple:
         masked_joined, dets = _single_pass_scan(joined)
         return col_idx, dets, list(zip(row_indices, masked_joined.split(DELIM)))
 
-    # Process all columns in parallel
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, num_cols)) as ex:
         futures = [ex.submit(_process_column, c) for c in range(num_cols)]
         for future in as_completed(futures):
@@ -548,14 +605,27 @@ def _process_json(file_bytes: bytes) -> tuple:
 # ── PREVIEW ───────────────────────────────────────────────────────
 
 def extract_preview_text(file_bytes: bytes, filename: str, max_chars: int = 2000) -> str:
+    """Extract a short preview. For large files, reads only the first page/chunk."""
     ext = filename.rsplit(".", 1)[-1].lower()
     try:
         if ext == "pdf":
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                return "\n".join(p.extract_text() or "" for p in pdf.pages)[:max_chars]
+                text = ""
+                for page in pdf.pages:
+                    text += (page.extract_text() or "") + "\n"
+                    if len(text) >= max_chars:
+                        break  # stop after we have enough — don't parse all pages
+                return text[:max_chars]
         elif ext == "docx":
-            return "\n".join(p.text for p in Document(io.BytesIO(file_bytes)).paragraphs)[:max_chars]
+            doc = Document(io.BytesIO(file_bytes))
+            text = ""
+            for p in doc.paragraphs:
+                text += p.text + "\n"
+                if len(text) >= max_chars:
+                    break
+            return text[:max_chars]
         else:
-            return file_bytes.decode("utf-8", errors="replace")[:max_chars]
+            # For text-based files just slice the raw bytes — very fast
+            return file_bytes[:max_chars * 4].decode("utf-8", errors="replace")[:max_chars]
     except Exception:
         return "[Preview unavailable]"
